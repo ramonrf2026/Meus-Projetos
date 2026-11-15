@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starlink — como funciona a constelação (pixel art 9:16)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #screen {
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    height: 100vh; width: calc(100vh * 9 / 16);
+    max-width: 100vw; max-height: calc(100vw * 16 / 9);
+    cursor: pointer;
+  }
+  #hint { position: fixed; bottom: 8px; left: 0; right: 0; text-align: center;
+          color: #556; font: 12px monospace; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="180" height="320"></canvas>
+<div id="hint">clique: pausar/continuar · ← →: pular cena</div>
+<script>
+'use strict';
+// ============================================================
+//  Framebuffer 180x320 (9:16). Tudo é desenhado pixel a pixel.
+// ============================================================
+const W = 180, H = 320;
+const cv = document.getElementById('screen');
+const ctx = cv.getContext('2d');
+const img = ctx.createImageData(W, H);
+const buf = new Uint32Array(img.data.buffer);
+
+function C(hex) { // '#rrggbb' -> uint32 ABGR (little endian)
+  const n = parseInt(hex.slice(1), 16);
+  return (0xFF000000 | ((n & 0xFF) << 16) | (n & 0xFF00) | ((n >> 16) & 0xFF)) >>> 0;
+}
+const PAL = {
+  space: C('#070a1f'), space2: C('#0d1233'), star: C('#ffffff'), star2: C('#8fa3d9'), star3: C('#3c4a80'),
+  oceanD: C('#1a4790'), ocean: C('#2a6fcf'), oceanL: C('#4b93e6'),
+  land: C('#3f9b4a'), landD: C('#2b6e36'), landL: C('#69c25a'), sand: C('#c9b36b'),
+  ice: C('#e8f1ff'), cloud: C('#f4f8ff'), cloudD: C('#b9c8e6'),
+  nightO: C('#0b1a3d'), nightL: C('#10291a'), city: C('#ffd36b'),
+  atmo: C('#6fd3ff'), atmo2: C('#2c7fd0'),
+  white: C('#ffffff'), gray: C('#9aa4b8'), grayD: C('#5b6378'), grayL: C('#d9dee8'), black: C('#000000'),
+  panel: C('#3d6fe0'), panelD: C('#22408a'), panelL: C('#7aa2ff'),
+  yellow: C('#ffd23f'), orange: C('#ff8c1a'), red: C('#ff3b3b'), laser: C('#ff4d6d'), laserL: C('#ffb3c1'),
+  cyan: C('#4cc9f0'), green: C('#5be37a'), pink: C('#ff7ab6'),
+  grass: C('#2d6a35'), grassL: C('#3f8a45'), dirt: C('#4a3222'), dirtD: C('#2e1f15'),
+  wall: C('#e8d5b0'), wallD: C('#b89d70'), roof: C('#b8442f'), roofD: C('#7f2a1c'), win: C('#ffe08a'),
+  shadow: C('#05061a'), tagBg: C('#1b2a6b'), fiber: C('#ff9f1c'),
+};
+
+function px(x, y, c) {
+  x |= 0; y |= 0;
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  buf[y * W + x] = c;
+}
+function rect(x, y, w, h, c) {
+  x |= 0; y |= 0;
+  const x0 = Math.max(0, x), y0 = Math.max(0, y), x1 = Math.min(W, x + w), y1 = Math.min(H, y + h);
+  for (let j = y0; j < y1; j++) for (let i = x0; i < x1; i++) buf[j * W + i] = c;
+}
+function disc(cx, cy, r, c) {
+  for (let j = -r; j <= r; j++) for (let i = -r; i <= r; i++)
+    if (i * i + j * j <= r * r + r * 0.8) px(cx + i, cy + j, c);
+}
+function ring(cx, cy, r, c, dash = 0, phase = 0) {
+  const n = Math.max(12, Math.round(r * 7));
+  for (let k = 0; k < n; k++) {
+    if (dash && ((k + phase) % (dash * 2)) >= dash) continue;
+    const a = k / n * Math.PI * 2;
+    px(Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r), c);
+  }
+}
+// linha Bresenham; dash = comprimento do traço (0 = contínua); phase anima "formiguinhas"
+function line(x0, y0, x1, y1, c, dash = 0, phase = 0) {
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, k = 0;
+  for (;;) {
+    if (!dash || (((k + Math.floor(phase)) % (dash * 2)) + dash * 2) % (dash * 2) < dash) px(x0, y0, c);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+    k++;
+  }
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[(y & 3) * 4 + (x & 3)];
+
+// ---------- aleatório determinístico + ruído periódico ----------
+function hash(a, b) {
+  let h = (a * 374761393 + b * 668265263) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function rng(seed) { let s = seed >>> 0; return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296); }
+function vnoise(x, y, period) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const p = (v) => ((v % period) + period) % period;
+  const a = hash(p(ix), iy), b = hash(p(ix + 1), iy), c = hash(p(ix), iy + 1), d = hash(p(ix + 1), iy + 1);
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+
+// ============================================================
+//  Fonte bitmap 5x7 (maiúsculas + acentos do português)
+// ============================================================
+const G = {
+  'A':'01110,10001,10001,11111,10001,10001,10001','B':'11110,10001,10001,11110,10001,10001,11110',
+  'C':'01110,10001,10000,10000,10000,10001,01110','D':'11110,10001,10001,10001,10001,10001,11110',
+  'E':'11111,10000,10000,11110,10000,10000,11111','F':'11111,10000,10000,11110,10000,10000,10000',
+  'G':'01110,10001,10000,10111,10001,10001,01111','H':'10001,10001,10001,11111,10001,10001,10001',
+  'I':'01110,00100,00100,00100,00100,00100,01110','J':'00111,00010,00010,00010,00010,10010,01100',
+  'K':'10001,10010,10100,11000,10100,10010,10001','L':'10000,10000,10000,10000,10000,10000,11111',
+  'M':'10001,11011,10101,10101,10001,10001,10001','N':'10001,10001,11001,10101,10011,10001,10001',
+  'O':'01110,10001,10001,10001,10001,10001,01110','P':'11110,10001,10001,11110,10000,10000,10000',
+  'Q':'01110,10001,10001,10001,10101,10010,01101','R':'11110,10001,10001,11110,10100,10010,10001',
+  'S':'01111,10000,10000,01110,00001,00001,11110','T':'11111,00100,00100,00100,00100,00100,00100',
+  'U':'10001,10001,10001,10001,10001,10001,01110','V':'10001,10001,10001,10001,10001,01010,00100',
+  'W':'10001,10001,10001,10101,10101,10101,01010','X':'10001,10001,01010,00100,01010,10001,10001',
+  'Y':'10001,10001,01010,00100,00100,00100,00100','Z':'11111,00001,00010,00100,01000,10000,11111',
+  '0':'01110,10001,10011,10101,11001,10001,01110','1':'00100,01100,00100,00100,00100,00100,01110',
+  '2':'01110,10001,00001,00010,00100,01000,11111','3':'11111,00010,00100,00010,00001,10001,01110',
+  '4':'00010,00110,01010,10010,11111,00010,00010','5':'11111,10000,11110,00001,00001,10001,01110',
+  '6':'00110,01000,10000,11110,10001,10001,01110','7':'11111,00001,00010,00100,01000,01000,01000',
+  '8':'01110,10001,10001,01110,10001,10001,01110','9':'01110,10001,10001,01111,00001,00010,01100',
+  '.':'00000,00000,00000,00000,00000,01100,01100',',':'00000,00000,00000,00000,01100,00100,01000',
+  ':':'00000,01100,01100,00000,01100,01100,00000','-':'00000,00000,00000,11111,00000,00000,00000',
+  '(':'00010,00100,01000,01000,01000,00100,00010',')':'01000,00100,00010,00010,00010,00100,01000',
+  '/':'00001,00010,00010,00100,01000,01000,10000','!':'00100,00100,00100,00100,00100,00000,00100',
+  '?':'01110,10001,00001,00010,00100,00000,00100','≈':'00000,01101,10110,00000,01101,10110,00000',
+  '~':'00000,00000,01101,10110,00000,00000,00000','→':'00000,00100,00010,11111,00010,00100,00000',
+  '↓':'00100,00100,00100,00100,10101,01110,00100','↔':'00000,00000,01010,11111,01010,00000,00000',
+  '+':'00000,00100,00100,11111,00100,00100,00000','=':'00000,00000,11111,00000,11111,00000,00000',
+  '%':'11000,11001,00010,00100,01000,10011,00011',"'":'00100,00100,01000,00000,00000,00000,00000',
+  '>':'01000,00100,00010,00001,00010,00100,01000','<':'00010,00100,01000,10000,01000,00100,00010',
+  ' ':'00000,00000,00000,00000,00000,00000,00000',
+};
+const ACC = { acute: '00010,00100', grave: '01000,00100', circ: '00100,01010', tilde: '01101,10110', ced: '00100,01100' };
+const COMPOSED = { 'Á':['A','acute'],'À':['A','grave'],'Â':['A','circ'],'Ã':['A','tilde'],'É':['E','acute'],
+  'Ê':['E','circ'],'Í':['I','acute'],'Ó':['O','acute'],'Ô':['O','circ'],'Õ':['O','tilde'],'Ú':['U','acute'],'Ç':['C','ced'] };
+const GLY = {};
+for (const k in G) GLY[k] = G[k].split(',');
+const ACCR = {}; for (const k in ACC) ACCR[k] = ACC[k].split(',');
+
+function glyph(ch, x, y, s, c) {
+  let base = ch, acc = null;
+  if (COMPOSED[ch]) [base, acc] = COMPOSED[ch];
+  const rows = GLY[base] || GLY['?'];
+  for (let r = 0; r < 7; r++) for (let q = 0; q < 5; q++)
+    if (rows[r][q] === '1') rect(x + q * s, y + r * s, s, s, c);
+  if (acc) {
+    const ar = ACCR[acc], oy = acc === 'ced' ? 7 : -3;
+    for (let r = 0; r < 2; r++) for (let q = 0; q < 5; q++)
+      if (ar[r][q] === '1') rect(x + q * s, y + (oy + r) * s, s, s, c);
+  }
+}
+const textW = (str, s = 1) => str.length * 6 * s - s;
+// desenha texto com sombra; reveal = nº de caracteres visíveis (efeito máquina de escrever)
+function text(str, x, y, c = PAL.white, { s = 1, align = 'center', reveal = Infinity, sh = PAL.shadow } = {}) {
+  const w = textW(str, s);
+  let x0 = align === 'center' ? Math.round(x - w / 2) : align === 'right' ? x - w : x;
+  const n = Math.min(str.length, Math.floor(reveal));
+  for (let i = 0; i < n; i++) {
+    const ch = str[i];
+    if (ch === ' ') continue;
+    if (sh !== null) { glyph(ch, x0 + i * 6 * s + s, y + s, s, sh); glyph(ch, x0 + i * 6 * s, y + s, s, sh); }
+    glyph(ch, x0 + i * 6 * s, y, s, c);
+  }
+}
+// bloco de linhas com máquina de escrever; retorna o tempo em que termina
+function typeLines(lines, y, lt, t0, { c = PAL.white, cps = 32, lh = 11, s = 1 } = {}) {
+  let t = t0;
+  lines.forEach((ln, i) => {
+    const str = typeof ln === 'string' ? ln : ln[0];
+    const col = typeof ln === 'string' ? c : ln[1];
+    const rev = (lt - t) * cps;
+    if (rev > 0) text(str, W / 2, y + i * lh, col, { s, reveal: rev });
+    t += str.length / cps + 0.12;
+  });
+  return t;
+}
+
+// ============================================================
+//  Elementos de cena
+// ============================================================
+const STARS = (() => { const r = rng(42), a = []; for (let i = 0; i < 170; i++) a.push([r() * W | 0, r() * H | 0, r(), r() * 6.28]); return a; })();
+function space(t, top = PAL.space, bottom = PAL.space2) {
+  for (let y = 0; y < H; y++) {
+    const f = y / H;
+    for (let x = 0; x < W; x++) buf[y * W + x] = bayer(x, y) < f * 0.9 ? bottom : top;
+  }
+  for (const [x, y, b, ph] of STARS) {
+    const tw = Math.sin(t * 2.2 + ph);
+    px(x, y, b > 0.85 ? (tw > 0.2 ? PAL.star : PAL.star2) : b > 0.45 ? PAL.star2 : PAL.star3);
+    if (b > 0.97 && tw > 0.6) { px(x - 1, y, PAL.star3); px(x + 1, y, PAL.star3); px(x, y - 1, PAL.star3); px(x, y + 1, PAL.star3); }
+  }
+}
+
+// Globo com textura procedural, iluminação em 3 tons e dithering no terminador.
+// yaw gira a Terra; tilt inclina a câmera (mostra mais o hemisfério norte).
+const LIGHT = (() => { const v = [-0.55, 0.5, 0.67]; const m = Math.hypot(...v); return v.map(a => a / m); })();
+function earthColor(lon, lat, shade, x, y, t, clouds = true) {
+  const u = (lon / (Math.PI * 2) + 1) * 14, v = (lat / Math.PI + 0.5) * 9;
+  const n = 0.62 * vnoise(u, v, 14) + 0.38 * vnoise(u * 2.3, v * 2.3, 32.2);
+  let col;
+  const ice = Math.abs(lat) > 1.22 + 0.08 * vnoise(u * 3, v * 3, 42);
+  const isLand = n > 0.56;
+  const day = shade + (bayer(x, y) - 0.5) * 0.25 > 0;
+  if (!day) {
+    if (ice) return PAL.nightO;
+    if (isLand) return (n > 0.62 && hash(Math.floor(u * 9), Math.floor(v * 9)) > 0.86) ? PAL.city : PAL.nightL;
+    return PAL.nightO;
+  }
+  const bright = shade + (bayer(x, y) - 0.5) * 0.3 > 0.62;
+  if (ice) col = PAL.ice;
+  else if (isLand) col = n > 0.66 ? (bright ? PAL.land : PAL.landD) : (n < 0.585 ? PAL.sand : (bright ? PAL.landL : PAL.land));
+  else col = bright ? PAL.ocean : (shade < 0.25 ? PAL.oceanD : PAL.ocean);
+  if (bright && !isLand && !ice && n > 0.5) col = PAL.oceanL;
+  if (clouds) {
+    const cn = vnoise(u * 1.7 + t * 0.15, v * 2.2, 23.8) * 0.6 + vnoise(u * 4, v * 5, 56) * 0.4;
+    if (cn > 0.68) col = shade > 0.35 ? PAL.cloud : PAL.cloudD;
+  }
+  return col;
+}
+function globe(cx, cy, r, yaw, tilt, t, { glow = true, clouds = true } = {}) {
+  const ct = Math.cos(tilt), st = Math.sin(tilt), cy_ = Math.cos(yaw), sy_ = Math.sin(yaw);
+  const x0 = Math.max(0, Math.floor(cx - r - 3)), x1 = Math.min(W - 1, Math.ceil(cx + r + 3));
+  const y0 = Math.max(0, Math.floor(cy - r - 3)), y1 = Math.min(H - 1, Math.ceil(cy + r + 3));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const dx = (x + 0.5 - cx) / r, dy = (y + 0.5 - cy) / r, d2 = dx * dx + dy * dy;
+    if (d2 > 1) {
+      if (glow) {
+        const d = Math.sqrt(d2) * r - r;
+        if (d < 1.2) buf[y * W + x] = PAL.atmo;
+        else if (d < 2.6 && bayer(x, y) < 0.55) buf[y * W + x] = PAL.atmo2;
+      }
+      continue;
+    }
+    const sz = Math.sqrt(1 - d2);
+    // vista -> mundo
+    const X1 = dx, Y2 = -sz, Z2 = -dy;
+    const Y1 = Y2 * ct + Z2 * st, Z1 = -Y2 * st + Z2 * ct;
+    const X = X1 * cy_ + Y1 * sy_, Y = -X1 * sy_ + Y1 * cy_, Z = Z1;
+    const shade = dx * LIGHT[0] + (-dy) * LIGHT[1] + sz * LIGHT[2];
+    let col = earthColor(Math.atan2(Y, X), Math.asin(Math.max(-1, Math.min(1, Z))), shade, x, y, t, clouds);
+    if (d2 > 0.93 && shade > 0) col = PAL.atmo2; // borda atmosférica
+    buf[y * W + x] = col;
+  }
+}
+// projeção de um ponto do mundo para a tela usando a mesma câmera do globo
+function project(p, cx, cy, r, yaw, tilt) {
+  const cyw = Math.cos(yaw), syw = Math.sin(yaw), ct = Math.cos(tilt), st = Math.sin(tilt);
+  const X1 = p[0] * cyw - p[1] * syw, Y1 = p[0] * syw + p[1] * cyw, Z1 = p[2];
+  const Y2 = Y1 * ct - Z1 * st, Z2 = Y1 * st + Z1 * ct;
+  return { x: cx + X1 * r, y: cy - Z2 * r, z: -Y2 };
+}
+function orbitPoint(inc, raan, u, R) {
+  const x = Math.cos(u), y = Math.sin(u) * Math.cos(inc), z = Math.sin(u) * Math.sin(inc);
+  return [(x * Math.cos(raan) - y * Math.sin(raan)) * R, (x * Math.sin(raan) + y * Math.cos(raan)) * R, z * R];
+}
+
+// Satélite Starlink estilizado: corpo chato + um painel solar longo
+function satellite(x, y, { flip = false, glow = false, t = 0, scale = 1 } = {}) {
+  x = Math.round(x); y = Math.round(y);
+  const s = scale, d = flip ? -1 : 1;
+  // painel solar
+  for (let i = 0; i < 9; i++) for (let j = 0; j < 3; j++) {
+    const c = (i % 3 === 2) ? PAL.panelD : (j === 0 ? PAL.panelL : PAL.panel);
+    rect(x + d * (3 + i) * s - (flip ? s - 1 : 0), y + (j - 1) * s, s, s, c);
+  }
+  rect(x + d * 2 * s - (flip ? s - 1 : 0), y, s, s, PAL.grayD); // haste
+  // corpo
+  for (let i = -2; i <= 1; i++) for (let j = -1; j <= 1; j++)
+    rect(x + d * i * s - (flip ? s - 1 : 0), y + j * s, s, s, j === -1 ? PAL.white : PAL.grayL);
+  if (glow && Math.sin(t * 10) > 0) px(x - d * 2 * s, y - 2 * s, PAL.green);
+}
+function tinySat(x, y, c = PAL.white) { px(x, y, c); px(x - 1, y, PAL.panel); px(x + 1, y, PAL.panel); }
+
+function dishIcon(x, y, angle = -0.6) { // antena retangular do usuário sobre um mastro
+  line(x, y, x, y + 6, PAL.grayD);
+  const ca = Math.cos(angle), sa = Math.sin(angle);
+  for (let i = -4; i <= 4; i++) for (let j = 0; j < 2; j++)
+    px(x + i * ca - j * sa, y - 1 + i * sa + j * ca, j ? PAL.gray : PAL.white);
+}
+function house(x, y) { // x,y = canto inferior esquerdo; 26 x 20
+  for (let i = 0; i < 14; i++) rect(x - 1 + i, y - 20 + 13 - i, 28 - 2 * i, 1, i < 2 ? PAL.roofD : PAL.roof);
+  rect(x + 2, y - 10, 22, 10, PAL.wall); rect(x + 2, y - 10, 22, 1, PAL.wallD);
+  rect(x + 5, y - 8, 5, 4, PAL.win); rect(x + 16, y - 8, 5, 4, PAL.win);
+  rect(x + 11, y - 6, 4, 6, PAL.roofD);
+}
+function gateway(x, y) { // estação terrestre: prédio + 2 radomes
+  rect(x, y - 9, 34, 9, PAL.grayL); rect(x, y - 9, 34, 1, PAL.white);
+  for (let i = 0; i < 4; i++) rect(x + 3 + i * 8, y - 6, 4, 2, PAL.cyan);
+  for (const ox of [7, 25]) {
+    for (let j = 0; j < 7; j++) for (let i = -6; i <= 6; i++) if (i * i + (j - 7) * (j - 7) <= 40) px(x + ox + i, y - 9 - 7 + j, j < 2 ? PAL.white : (i < 0 ? PAL.white : PAL.grayL));
+    rect(x + ox - 1, y - 11, 3, 2, PAL.gray);
+  }
+}
+function cloudIcon(cx, cy, t) {
+  const blobs = [[-9, 2, 6], [-2, -3, 8], [8, 0, 6], [0, 4, 6], [12, 4, 4], [-13, 5, 3]];
+  for (const [ox, oy, r] of blobs) disc(cx + ox, cy + oy, r, PAL.cloudD);
+  for (const [ox, oy, r] of blobs) disc(cx + ox, cy + oy - 1, r - 1, PAL.white);
+  text('WWW', cx, cy - 2, Math.sin(t * 4) > 0 ? PAL.panel : PAL.panelD, { sh: null });
+}
+function packet(x, y, c = PAL.yellow, t = 0) {
+  const k = Math.sin(t * 20) > 0;
+  rect(x - 1, y - 1, 3, 3, c); px(x, y, PAL.white);
+  if (k) { px(x - 2, y, c); px(x + 2, y, c); px(x, y - 2, c); px(x, y + 2, c); }
+}
+function alongPath(pts, f) { // posição ao longo de uma polilinha, f ∈ [0,1]
+  const seg = []; let L = 0;
+  for (let i = 1; i < pts.length; i++) { const l = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); seg.push(l); L += l; }
+  let d = Math.max(0, Math.min(1, f)) * L;
+  for (let i = 0; i < seg.length; i++) {
+    if (d <= seg[i] || i === seg.length - 1) {
+      const k = seg[i] ? d / seg[i] : 0;
+      return [pts[i][0] + (pts[i + 1][0] - pts[i][0]) * k, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * k, i];
+    }
+    d -= seg[i];
+  }
+}
+function header(n, title, lt) {
+  const slide = Math.min(1, lt / 0.35);
+  const y = Math.round(-30 + 38 * (1 - Math.pow(1 - slide, 3)));
+  if (n) {
+    const tag = `PASSO ${n}/6`;
+    rect(W / 2 - textW(tag) / 2 - 3, y - 2, textW(tag) + 6, 11, PAL.tagBg);
+    text(tag, W / 2, y, PAL.cyan, { sh: null });
+  }
+  text(title, W / 2, y + 13, PAL.white, { s: 2, reveal: (lt - 0.15) * 30 });
+}
+function sky(top, bottom, horizonY) {
+  for (let y = 0; y < horizonY; y++) {
+    const f = Math.pow(y / horizonY, 1.6);
+    for (let x = 0; x < W; x++) buf[y * W + x] = bayer(x, y) < f ? bottom : top;
+  }
+}
+
+// ============================================================
+//  Cenas
+// ============================================================
+const SCENES = [];
+function scene(dur, fn) { SCENES.push({ dur, fn }); }
+
+// 0 — Abertura
+scene(6.5, (lt, t) => {
+  space(t);
+  globe(90, 470, 230, t * 0.04, 0.35, t);
+  // "trem" de satélites logo após o lançamento
+  for (let i = 0; i < 14; i++) {
+    const x = -60 + lt * 32 + i * 9, y = 222 - x * 0.22;
+    tinySat(Math.round(x), Math.round(y), (i + Math.floor(lt * 6)) % 5 === 0 ? PAL.yellow : PAL.white);
+  }
+  const k = Math.min(1, lt / 0.6);
+  text('STARLINK', W / 2, Math.round(40 + (1 - k) * -40), PAL.white, { s: 3, reveal: lt * 14, sh: PAL.panelD });
+  if (lt > 1.0) text('COMO FUNCIONA A', W / 2, 88, PAL.cyan, { reveal: (lt - 1.0) * 30 });
+  if (lt > 1.5) text('CONSTELAÇÃO', W / 2, 104, PAL.white, { s: 2, reveal: (lt - 1.5) * 20 });
+  if (lt > 2.1) text('DE SATÉLITES', W / 2, 126, PAL.cyan, { reveal: (lt - 2.1) * 30 });
+  if (lt > 3.2) {
+    const b = Math.sin(lt * 5) > -0.3;
+    if (b) text('EXPLICADA EM 6 PASSOS', W / 2, 160, PAL.yellow, { reveal: (lt - 3.2) * 30 });
+  }
+});
+
+// 1 — Órbita baixa vs geoestacionária (escala aproximada)
+scene(9.5, (lt, t) => {
+  space(t);
+  header(1, 'ÓRBITA BAIXA', lt);
+  const ex = 90, ey = 234, er = 22; // Terra (raio 6.371 km ≈ 22 px)
+  globe(ex, ey, er, t * 0.4, 0.3, t);
+  // LEO: ~500 km ≈ +2 px. Pequenos satélites girando rente à Terra
+  for (let i = 0; i < 18; i++) {
+    const a = i / 18 * Math.PI * 2 + lt * 0.9;
+    const x = ex + Math.cos(a) * (er + 3), y = ey + Math.sin(a) * (er + 3) * 0.35;
+    if (Math.sin(a) < 0 && Math.abs(x - ex) < er) continue; // atrás da Terra
+    px(Math.round(x), Math.round(y), PAL.yellow);
+  }
+  // GEO: ~35.786 km ≈ +124 px acima
+  const gy = ey - er - 124;
+  line(ex, ey - er - 4, ex, gy + 5, PAL.star3, 2, 0);
+  satellite(ex, gy, { t: lt, glow: true });
+  if (lt > 0.8) {
+    text('GEO', ex + 18, gy - 8, PAL.pink, { align: 'left', reveal: (lt - 0.8) * 30 });
+    text('~36.000 KM', ex + 18, gy + 2, PAL.white, { align: 'left', reveal: (lt - 0.8) * 30 });
+  }
+  if (lt > 1.6) {
+    line(ex - 30, ey - 34, ex - 18, ey - 18, PAL.yellow);
+    text('LEO', ex - 34, ey - 54, PAL.yellow, { align: 'right', reveal: (lt - 1.6) * 30 });
+    text('~500 KM', ex - 26, ey - 44, PAL.white, { align: 'right', reveal: (lt - 1.6) * 30 });
+  }
+  // pulsos de sinal: LEO vai e volta rápido, GEO demora
+  if (lt > 2.4) {
+    const pg = ((lt - 2.4) % 3.0) / 3.0; // ida e volta GEO
+    const yy = pg < 0.5 ? (ey - er) + (gy - (ey - er)) * (pg * 2) : gy + ((ey - er) - gy) * ((pg - 0.5) * 2);
+    packet(ex + 3, Math.round(yy), PAL.pink, lt);
+    const pl = ((lt - 2.4) % 0.4) / 0.4;
+    if (pl < 0.5) ring(ex - 4, ey - er - 2, 2 + pl * 4, PAL.yellow);
+    text('(ESCALA APROXIMADA)', W / 2, 264, PAL.grayD, { reveal: (lt - 2.4) * 30, sh: null });
+  }
+  typeLines([
+    'MAIS PERTO DA TERRA =',
+    'MENOS ATRASO NO SINAL',
+    ['LEO: DEZENAS DE MS', PAL.yellow],
+    ['GEO: ~600 MS OU MAIS', PAL.pink],
+  ], 280, lt, 3.0, { lh: 10 });
+});
+
+// 2 — A constelação: planos orbitais em várias inclinações
+const PLANES = (() => {
+  const a = [];
+  for (let k = 0; k < 12; k++) a.push({ inc: 53 * Math.PI / 180, raan: k * Math.PI / 6, n: 11, c: PAL.white, R: 1.13, ph: k * 0.3 });
+  for (let k = 0; k < 5; k++) a.push({ inc: 70 * Math.PI / 180, raan: k * Math.PI / 2.5 + 0.3, n: 9, c: PAL.yellow, R: 1.17, ph: k });
+  for (let k = 0; k < 4; k++) a.push({ inc: 97.6 * Math.PI / 180, raan: k * Math.PI / 4 + 0.7, n: 9, c: PAL.pink, R: 1.21, ph: k * 2 });
+  // embaralha a ordem de aparição sem misturar as camadas
+  return a;
+})();
+scene(10, (lt, t) => {
+  space(t);
+  header(2, 'CONSTELAÇÃO', lt);
+  const cx = 90, cy = 168, r = 50, yaw = 0.6 + lt * 0.18, tilt = 0.38;
+  const shown = Math.min(PLANES.length, Math.floor(Math.max(0, lt - 0.6) * 3.2));
+  // órbitas e satélites atrás do globo primeiro
+  const front = [];
+  for (let pi = 0; pi < shown; pi++) {
+    const P = PLANES[pi];
+    for (let s = 0; s < 72; s++) {
+      const q = project(orbitPoint(P.inc, P.raan, s / 72 * Math.PI * 2, P.R), cx, cy, r, yaw, tilt);
+      const hidden = q.z < 0 && Math.hypot(q.x - cx, q.y - cy) < r + 1;
+      if (!hidden && s % 2 === 0) (q.z < 0 ? px(q.x, q.y, PAL.star3) : front.push([q.x, q.y, PAL.tagBg, 0]));
+    }
+    for (let s = 0; s < P.n; s++) {
+      const u = s / P.n * Math.PI * 2 + lt * 0.55 + P.ph;
+      const q = project(orbitPoint(P.inc, P.raan, u, P.R), cx, cy, r, yaw, tilt);
+      const hidden = q.z < 0 && Math.hypot(q.x - cx, q.y - cy) < r + 1;
+      if (hidden) continue;
+      if (q.z < 0) px(q.x, q.y, PAL.grayD); else front.push([q.x, q.y, P.c, 1]);
+    }
+  }
+  globe(cx, cy, r, yaw, tilt, t);
+  for (const [x, y, c, isSat] of front) {
+    if (isSat) { px(x, y, c); px(x - 1, y, PAL.panel); px(x + 1, y, PAL.panel); }
+    else px(x, y, c);
+  }
+  // legenda das camadas
+  if (lt > 1.2) {
+    const lg = [['INCL. 53', PAL.white], ['INCL. 70', PAL.yellow], ['POLAR', PAL.pink]];
+    lg.forEach(([s, c], i) => { if (lt > 1.2 + i * 1.3) { tinySat(14, 244 + i * 9 + 3, c); text(s, 20, 244 + i * 9, c, { align: 'left', reveal: (lt - 1.2 - i * 1.3) * 30 }); } });
+  }
+  text('MILHARES DE SATÉLITES', W / 2, 52, PAL.cyan, { reveal: (lt - 0.4) * 30 });
+  typeLines([
+    'EM VÁRIAS CAMADAS E PLANOS',
+    'ORBITAIS, PARA COBRIR',
+    'QUASE TODO O PLANETA',
+  ], 280, lt, 2.4, { lh: 10 });
+});
+
+// 3 — Sempre em movimento: rastreio e troca de satélite
+scene(10, (lt, t) => {
+  sky(PAL.space, C('#22357a'), 262);
+  for (const [x, y, b, ph] of STARS) if (y < 200 && b > 0.6) px(x, y, Math.sin(t * 2 + ph) > 0 ? PAL.star2 : PAL.star3);
+  // chão
+  rect(0, 262, W, 58, PAL.grass);
+  for (let x = 0; x < W; x++) { if (hash(x, 7) > 0.6) px(x, 261, PAL.grassL); for (let y = 270; y < H; y++) if (hash(x, y) > 0.93) px(x, y, PAL.grassL); }
+  // árvores
+  for (const tx of [12, 160, 172]) { rect(tx, 250, 2, 12, PAL.dirt); disc(tx + 1, 246, 6, PAL.landD); disc(tx, 245, 4, PAL.land); }
+  house(52, 262);
+  const dx = 112, dy = 249; // antena
+  // satélites cruzando o céu (arco)
+  const spacing = 0.33, speed = 0.11; // fração do arco
+  const sats = [];
+  for (let i = -1; i < 5; i++) {
+    const s = ((lt * speed) + i * spacing) % (spacing * 4) - 0.15;
+    const x = -20 + s * 220, y = 175 - Math.sin(Math.max(0, Math.min(1, s)) * Math.PI) * 95;
+    sats.push({ s, x, y });
+  }
+  // alvo = satélite mais próximo do zênite
+  let best = null;
+  for (const q of sats) if (q.s > 0.05 && q.s < 0.95 && (!best || Math.abs(q.s - 0.55) < Math.abs(best.s - 0.55))) best = q;
+  // detectar troca recente: fase relativa
+  const phase = (((lt * speed) % spacing) + spacing) % spacing;
+  for (const q of sats) satellite(q.x, q.y, { t: lt, glow: q === best });
+  if (best) {
+    const ang = Math.atan2(best.y - dy, best.x - dx);
+    line(dx, dy - 2, best.x, best.y + 3, PAL.yellow, 2, -lt * 18);
+    dishIcon(dx, dy, ang + Math.PI / 2 > 0 ? Math.max(-1.1, Math.min(1.1, ang + Math.PI / 2)) * 0.6 : 0);
+  } else dishIcon(dx, dy, 0);
+  // aviso "TROCA!" logo após o satélite-alvo mudar
+  const sinceSwitch = ((phase - ((0.55 + 0.15) % spacing)) + spacing * 2) % spacing / speed;
+  if (lt > 1 && sinceSwitch < 0.8) text('TROCA!', dx + 2, dy - 26, PAL.yellow, { s: 1 });
+  text('ANTENA', dx, 268, PAL.white);
+  header(3, 'EM MOVIMENTO', lt);
+  typeLines([['~27.000 KM/H', PAL.yellow], 'UMA VOLTA NA TERRA ≈ 95 MIN'], 50, lt, 0.8, { lh: 11 });
+  typeLines(['A ANTENA ACOMPANHA E TROCA', 'DE SATÉLITE AUTOMATICAMENTE'], 284, lt, 3.0, { lh: 11 });
+});
+
+// 4 — O caminho do sinal
+scene(11, (lt, t) => {
+  sky(PAL.space, C('#1b2c6e'), 240);
+  for (const [x, y, b, ph] of STARS) if (y < 200 && b > 0.65) px(x, y, PAL.star3);
+  rect(0, 240, W, 8, PAL.grass); for (let x = 0; x < W; x++) if (hash(x, 3) > 0.6) px(x, 239, PAL.grassL);
+  // corte do subsolo
+  for (let y = 248; y < H; y++) for (let x = 0; x < W; x++) buf[y * W + x] = bayer(x, y) < (y - 248) / 140 ? PAL.dirtD : PAL.dirt;
+  house(10, 240); dishIcon(30, 218, -0.5);
+  gateway(132, 240);
+  const sx = 90, sy = 98 + Math.round(Math.sin(lt * 2) * 1.5);
+  satellite(sx, sy, { t: lt, glow: true });
+  // fibra óptica subterrânea
+  const fiber = [[149, 248], [149, 262], [112, 262], [112, 290]];
+  for (let i = 1; i < fiber.length; i++) line(fiber[i - 1][0], fiber[i - 1][1], fiber[i][0], fiber[i][1], PAL.fiber, 3, -lt * 12);
+  cloudIcon(90, 294, lt);
+  // trajeto completo (ida em amarelo, volta em ciano)
+  const path = [[30, 216], [sx, sy + 3], [149, 220], [149, 248], [149, 262], [112, 262], [112, 286]];
+  line(30, 216, sx, sy + 3, PAL.star3, 1, 0);
+  line(sx, sy + 3, 142, 222, PAL.star3, 1, 0);
+  const cyc = 5.0, k = Math.max(0, lt - 1.0);
+  const leg = Math.floor(k / cyc), f = (k % cyc) / cyc;
+  const fwd = leg % 2 === 0;
+  const [qx, qy, segIdx] = alongPath(path, fwd ? f : 1 - f);
+  if (lt > 1.0) packet(qx, qy, fwd ? PAL.yellow : PAL.cyan, lt);
+  // rótulos numerados aparecem à medida que o pacote passa
+  const reached = lt < 1 ? -1 : (leg > 0 ? 9 : segIdx);
+  const tag = (n, s, x, y, al = 'center') => {
+    const w = textW(s) + 12, x0 = al === 'center' ? x - w / 2 : al === 'left' ? x : x - w;
+    rect(x0, y - 2, w, 11, PAL.tagBg); rect(x0, y - 2, 9, 11, PAL.yellow);
+    text(String(n), x0 + 5, y, PAL.black, { sh: null }); text(s, x0 + 11, y, PAL.white, { align: 'left', sh: null });
+  };
+  if (lt > 0.9) tag(1, 'ANTENA', 4, 192, 'left');
+  if (reached >= 1) tag(2, 'SATÉLITE', sx, sy - 18);
+  if (reached >= 2) { tag(3, 'ESTAÇÃO', 176, 192, 'right'); text('TERRESTRE', 149, 204, PAL.gray, { sh: null }); }
+  if (reached >= 4) tag(4, 'INTERNET', 90, 308);
+  if (!fwd) text('RESPOSTA VOLTANDO', W / 2, 136, PAL.cyan);
+  else if (lt > 1.0) text('SEU PEDIDO SUBINDO', W / 2, 136, PAL.yellow);
+  header(4, 'O SINAL', lt);
+  typeLines(['O PEDIDO SOBE, DESCE NUMA', 'ESTAÇÃO E SEGUE POR FIBRA'], 50, lt, 0.6, { lh: 11 });
+});
+
+// 5 — Links a laser entre satélites (sobre o oceano)
+scene(11, (lt, t) => {
+  space(t);
+  const hy = (x) => 228 + (x - 90) * (x - 90) / 640;
+  for (let x = 0; x < W; x++) {
+    const h = Math.round(hy(x));
+    for (let y = h - 2; y < H; y++) {
+      if (y < h) { if (bayer(x, y) < 0.6) px(x, y, PAL.atmo2); continue; }
+      const land = x > 146 + Math.sin(y * 0.2) * 3;
+      let c;
+      if (land) c = y === h ? PAL.landL : (bayer(x, y) < 0.3 ? PAL.landD : PAL.land);
+      else {
+        const wv = Math.sin(x * 0.35 + y * 0.9 - lt * 3) + Math.sin(x * 0.13 - lt * 1.3);
+        c = y === h ? PAL.oceanL : (wv > 1.35 ? PAL.oceanL : (y - h > 40 && bayer(x, y) < 0.5 ? PAL.oceanD : PAL.ocean));
+      }
+      buf[y * W + x] = c;
+    }
+  }
+  // navio
+  const shx = 22, shy = Math.round(hy(22)) + 1 + (Math.sin(lt * 3) > 0.6 ? 1 : 0);
+  rect(shx - 9, shy - 3, 19, 3, PAL.roofD); rect(shx - 8, shy - 1, 17, 1, PAL.dirtD);
+  rect(shx - 4, shy - 7, 8, 4, PAL.white); rect(shx - 3, shy - 6, 1, 1, PAL.cyan); rect(shx, shy - 6, 1, 1, PAL.cyan);
+  dishIcon(shx + 6, shy - 10, -0.7);
+  gateway(146, Math.round(hy(163)) + 1);
+  // satélites em arco
+  const S = [[34, 132], [76, 112], [118, 112], [158, 130]].map(([x, y], i) => [x, y + Math.round(Math.sin(lt * 1.5 + i) * 1)]);
+  const gx = 154, gy = Math.round(hy(163)) - 14;
+  const path = [[shx + 6, shy - 12], [S[0][0], S[0][1] + 3], S[1], S[2], [S[3][0], S[3][1] + 3], [gx, gy]];
+  const cyc = 5.0, k = Math.max(0, lt - 1.0), f = (k % cyc) / cyc;
+  const [qx, qy, seg] = alongPath(path, f);
+  // links
+  line(path[0][0], path[0][1], path[1][0], path[1][1], seg === 0 && lt > 1 ? PAL.yellow : PAL.star3, 2, -lt * 15);
+  for (let i = 0; i < 3; i++) {
+    const on = lt > 1 && seg === i + 1;
+    const a = S[i], b = S[i + 1];
+    line(a[0] + 4, a[1], b[0] - 4, b[1], on ? PAL.laser : C('#5a1f33'));
+    if (on) line(a[0] + 4, a[1] - 1, b[0] - 4, b[1] - 1, PAL.laserL, 3, -lt * 25);
+  }
+  line(path[4][0], path[4][1], gx, gy, seg === 4 && lt > 1 ? PAL.yellow : PAL.star3, 2, -lt * 15);
+  S.forEach(([x, y], i) => satellite(x, y, { t: lt, glow: lt > 1 && seg === i + 1, flip: i >= 2 }));
+  if (lt > 1) packet(qx, qy, seg >= 1 && seg <= 3 ? PAL.laserL : PAL.yellow, lt);
+  if (lt > 1.5) text('LASER', 97, 98, PAL.laser, { reveal: (lt - 1.5) * 30 });
+  if (lt > 1.2) text('NAVIO', 22, 210, PAL.white, { reveal: (lt - 1.2) * 30 });
+  if (lt > 1.2) text('ESTAÇÃO', 158, 196, PAL.white, { reveal: (lt - 1.2) * 30 });
+  header(5, 'LASERS', lt);
+  typeLines(['NO MEIO DO OCEANO NÃO HÁ', 'ESTAÇÃO TERRESTRE POR PERTO'], 50, lt, 0.6, { lh: 11, c: PAL.cyan });
+  typeLines(['OS SATÉLITES REPASSAM O SINAL', 'ENTRE SI POR LASER ATÉ', 'CHEGAR A UMA ESTAÇÃO'], 268, lt, 2.8, { lh: 11 });
+});
+
+// 6 — Ciclo de vida: lançamento em lote e reentrada
+function rocket(x, y, t, fairingOpen = 0) {
+  x = Math.round(x); y = Math.round(y);
+  rect(x - 2, y, 5, 46, PAL.white); rect(x + 1, y, 2, 46, PAL.grayL);
+  rect(x - 2, y + 16, 5, 2, PAL.black); // interstage
+  rect(x - 3, y + 42, 7, 4, PAL.grayD); // pernas recolhidas
+  text('X', x, y + 24, PAL.panelD, { sh: null, s: 1 });
+  // coifa (fairing)
+  const o = Math.round(fairingOpen * 10);
+  for (let j = 0; j < 12; j++) {
+    const w = Math.min(3, 1 + Math.floor(j / 3));
+    rect(x - w - o, y - 12 + j, w, 1, PAL.white);
+    rect(x + 1 + o - (o ? 0 : 1) + (o ? 0 : 0), y - 12 + j, w, 1, PAL.grayL);
+  }
+  if (!fairingOpen) rect(x - 1, y - 12, 3, 12, PAL.white);
+  // chama
+  for (let j = 0; j < 14; j++) for (let i = -3; i <= 3; i++) {
+    const v = hash(i + Math.floor(t * 30), j) + (j / 14);
+    if (Math.abs(i) <= 3 - j / 5 && v < 1.15) px(x + i, y + 46 + j, j < 3 ? PAL.white : v < 0.7 ? PAL.yellow : v < 0.95 ? PAL.orange : PAL.red);
+  }
+}
+scene(11, (lt, t) => {
+  space(t);
+  globe(90, 520, 250, t * 0.04, 0.3, t);
+  // ---- fase A: lançamento ----
+  if (lt < 6.0) {
+    const tl = lt;
+    const ry = tl < 3.4 ? 300 - 190 * Math.pow(tl / 3.4, 2) : 110 - (tl - 3.4) * 4;
+    const rx = 60 + (tl < 3.4 ? 0 : (tl - 3.4) * 3);
+    const open = Math.max(0, Math.min(1, (tl - 3.6) / 0.6));
+    // fumaça
+    for (let i = 0; i < 26; i++) {
+      const sy = 300 - i * 7, age = tl - Math.sqrt(Math.max(0, (300 - sy) / 190)) * 3.4;
+      if (sy > ry + 50 && age > 0) disc(60 + Math.round(Math.sin(i * 1.7) * age * 3), sy, Math.min(6, 1 + Math.floor(age * 3)), age > 1.5 ? PAL.star3 : PAL.grayD);
+    }
+    if (tl < 5.2) rocket(rx, ry, lt, open);
+    // satélites saindo em pilha e se espalhando
+    if (tl > 3.9) {
+      const k = Math.min(1, (tl - 3.9) / 1.6);
+      for (let i = 0; i < 8; i++) {
+        const x = rx + (20 + i * 13) * k, y = ry - 6 + i * 1.5 - (i * 1.5 + 6) * k * 0.3 + (1 - k) * (i * 1.2);
+        satellite(x, y, { t: lt });
+      }
+    }
+    typeLines(['LANÇADOS EM LOTES PELO', ['FOGUETE FALCON 9', PAL.yellow]], 50, lt, 0.6, { lh: 11 });
+  } else {
+    // ---- fase B: reentrada no fim da vida útil ----
+    const tl = lt - 6.0, k = Math.min(1, tl / 4.2);
+    const x = 150 - 110 * k, y = 90 + 150 * k * k;
+    const burn = Math.max(0, (k - 0.25) / 0.75);
+    // rastro de fogo
+    for (let i = 0; i < 40 * burn; i++) {
+      const b = i / 40, jx = (hash(i, Math.floor(lt * 20)) - 0.5) * (2 + b * 6);
+      const xx = x + b * 40 + jx, yy = y - b * 52 * (0.4 + k) + (hash(i, 99) - 0.5) * 3;
+      px(xx, yy, b < 0.15 ? PAL.white : b < 0.35 ? PAL.yellow : b < 0.65 ? PAL.orange : (hash(i, 5) > 0.5 ? PAL.red : PAL.roofD));
+    }
+    if (k < 0.9) satellite(x, y, { flip: true, scale: 1 });
+    if (burn > 0.2) disc(Math.round(x), Math.round(y), 2 + (Math.sin(lt * 30) > 0 ? 1 : 0), PAL.yellow);
+    if (k >= 0.9) for (let i = 0; i < 10; i++) px(x + (hash(i, 1) - 0.5) * 12 * (k - 0.85) * 20, y + hash(i, 2) * 8, PAL.orange);
+    typeLines(['NO FIM DA VIDA ÚTIL, SAEM DE', 'ÓRBITA E QUEIMAM NA', ['ATMOSFERA', PAL.orange]], 50, tl, 0.3, { lh: 11 });
+    typeLines(['ÓRBITA BAIXA AJUDA A EVITAR', 'LIXO ESPACIAL DURADOURO'], 284, tl, 2.4, { lh: 11, c: PAL.cyan });
+  }
+  header(6, 'CICLO DE VIDA', lt);
+});
+
+// 7 — Resumo
+scene(9, (lt, t) => {
+  space(t);
+  header(0, 'RESUMO', lt + 0.2);
+  const steps = [
+    ['ANTENA', 'NA SUA CASA', (x, y) => dishIcon(x, y + 2, -0.5)],
+    ['SATÉLITE', 'EM ÓRBITA BAIXA', (x, y) => satellite(x - 2, y, { t: lt })],
+    ['LASER', 'NO MEIO DO OCEANO', (x, y) => { line(x - 8, y, x + 8, y, PAL.laser); line(x - 8, y - 1, x + 8, y - 1, PAL.laserL, 2, -lt * 20); }],
+    ['ESTAÇÃO TERRESTRE', 'LIGA O SINAL À REDE', (x, y) => { const o = 0; for (let j = 0; j < 5; j++) for (let i = -5; i <= 5; i++) if (i * i + (j - 5) * (j - 5) <= 26) px(x + i, y - 2 + j + o, PAL.white); rect(x - 7, y + 3, 15, 3, PAL.grayL); }],
+    ['INTERNET', 'VIA FIBRA ÓPTICA', (x, y) => { disc(x - 3, y + 1, 3, PAL.white); disc(x + 2, y - 1, 4, PAL.white); disc(x + 6, y + 2, 2, PAL.white); }],
+  ];
+  const y0 = 64, dy = 42;
+  steps.forEach(([a, b, icon], i) => {
+    const at = 0.5 + i * 0.9;
+    if (lt < at) return;
+    const y = y0 + i * dy;
+    rect(10, y - 4, 160, 30, PAL.tagBg);
+    const active = lt > 5.0 && Math.floor((lt - 5.0) * 1.6) % 5 === i;
+    rect(10, y - 4, 3, 30, active ? PAL.yellow : (i === 2 ? PAL.laser : PAL.cyan));
+    if (active) { rect(10, y - 4, 160, 1, PAL.yellow); rect(10, y + 25, 160, 1, PAL.yellow); }
+    icon(30, y + 10);
+    text(a, 50, y + 2, i === 2 ? PAL.laser : PAL.white, { align: 'left', reveal: (lt - at) * 40 });
+    text(b, 50, y + 13, PAL.gray, { align: 'left', reveal: (lt - at - 0.2) * 40, sh: null });
+    if (i < steps.length - 1) text('↓', 30, y + 28, PAL.yellow, { sh: null });
+  });
+  typeLines(['INTERNET VIA ESPAÇO', ['COM BAIXA LATÊNCIA', PAL.yellow]], 284, lt, 5.0, { lh: 12 });
+});
+
+// ============================================================
+//  Transições (dithering) e loop principal
+// ============================================================
+const TOTAL = SCENES.reduce((a, s) => a + s.dur, 0);
+const FADE = 0.45;
+function fadeOverlay(a) { // a ∈ [0,1]: 1 = preto total
+  if (a <= 0) return;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (bayer(x >> 1, y >> 1) < a) buf[y * W + x] = PAL.black;
+}
+function renderAt(t) {
+  t = ((t % TOTAL) + TOTAL) % TOTAL;
+  let acc = 0;
+  for (let i = 0; i < SCENES.length; i++) {
+    const s = SCENES[i];
+    if (t < acc + s.dur || i === SCENES.length - 1) {
+      const lt = t - acc;
+      s.fn(lt, t);
+      const a = Math.max(lt < FADE ? 1 - lt / FADE : 0, lt > s.dur - FADE ? (lt - (s.dur - FADE)) / FADE : 0);
+      fadeOverlay(a);
+      break;
+    }
+    acc += s.dur;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+// exportação de quadros (usada pelo render.mjs)
+window.__starlink = {
+  W, H, TOTAL, renderAt,
+  frameB64(t) { renderAt(t); const u8 = new Uint8Array(img.data.buffer); let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); },
+};
+
+const params = new URLSearchParams(location.search);
+let paused = params.has('t'), clock = parseFloat(params.get('t') || '0'), last = performance.now();
+function sceneStart(i) { let a = 0; for (let k = 0; k < i; k++) a += SCENES[k].dur; return a; }
+function currentScene() { let a = 0; for (let i = 0; i < SCENES.length; i++) { a += SCENES[i].dur; if (clock % TOTAL < a) return i; } return 0; }
+cv.addEventListener('click', () => { paused = !paused; });
+addEventListener('keydown', (e) => {
+  if (e.key === ' ') paused = !paused;
+  if (e.key === 'ArrowRight') clock = sceneStart((currentScene() + 1) % SCENES.length) + 0.01;
+  if (e.key === 'ArrowLeft') clock = sceneStart((currentScene() + SCENES.length - 1) % SCENES.length) + 0.01;
+});
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  if (!paused) clock += dt;
+  if (!params.has('record')) renderAt(clock);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
