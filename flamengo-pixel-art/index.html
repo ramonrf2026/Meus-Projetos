@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flamengo — a história em 30 segundos (pixel art 9:16)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #screen {
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    height: 100vh; width: calc(100vh * 9 / 16);
+    max-width: 100vw; max-height: calc(100vw * 16 / 9);
+    cursor: pointer;
+  }
+  #hint { position: fixed; bottom: 8px; left: 0; right: 0; text-align: center;
+          color: #556; font: 12px monospace; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="180" height="320"></canvas>
+<div id="hint">clique: pausar/continuar · ← →: pular cena</div>
+<script>
+'use strict';
+// ============================================================
+//  Framebuffer 180x320 (9:16). Tudo é desenhado pixel a pixel.
+// ============================================================
+const W = 180, H = 320;
+const cv = document.getElementById('screen');
+const ctx = cv.getContext('2d');
+const img = ctx.createImageData(W, H);
+const buf = new Uint32Array(img.data.buffer);
+
+function C(hex) { // '#rrggbb' -> uint32 ABGR (little endian)
+  const n = parseInt(hex.slice(1), 16);
+  return (0xFF000000 | ((n & 0xFF) << 16) | (n & 0xFF00) | ((n >> 16) & 0xFF)) >>> 0;
+}
+const PAL = {
+  space: C('#070a1f'), space2: C('#0d1233'), star: C('#ffffff'), star2: C('#8fa3d9'), star3: C('#3c4a80'),
+  oceanD: C('#1a4790'), ocean: C('#2a6fcf'), oceanL: C('#4b93e6'),
+  land: C('#3f9b4a'), landD: C('#2b6e36'), landL: C('#69c25a'), sand: C('#c9b36b'),
+  ice: C('#e8f1ff'), cloud: C('#f4f8ff'), cloudD: C('#b9c8e6'),
+  nightO: C('#0b1a3d'), nightL: C('#10291a'), city: C('#ffd36b'),
+  atmo: C('#6fd3ff'), atmo2: C('#2c7fd0'),
+  white: C('#ffffff'), gray: C('#9aa4b8'), grayD: C('#5b6378'), grayL: C('#d9dee8'), black: C('#000000'),
+  panel: C('#3d6fe0'), panelD: C('#22408a'), panelL: C('#7aa2ff'),
+  yellow: C('#ffd23f'), orange: C('#ff8c1a'), red: C('#ff3b3b'), laser: C('#ff4d6d'), laserL: C('#ffb3c1'),
+  cyan: C('#4cc9f0'), green: C('#5be37a'), pink: C('#ff7ab6'),
+  grass: C('#2d6a35'), grassL: C('#3f8a45'), dirt: C('#4a3222'), dirtD: C('#2e1f15'),
+  wall: C('#e8d5b0'), wallD: C('#b89d70'), roof: C('#b8442f'), roofD: C('#7f2a1c'), win: C('#ffe08a'),
+  shadow: C('#05061a'), tagBg: C('#1b2a6b'), fiber: C('#ff9f1c'),
+};
+
+function px(x, y, c) {
+  x |= 0; y |= 0;
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  buf[y * W + x] = c;
+}
+function rect(x, y, w, h, c) {
+  x |= 0; y |= 0;
+  const x0 = Math.max(0, x), y0 = Math.max(0, y), x1 = Math.min(W, x + w), y1 = Math.min(H, y + h);
+  for (let j = y0; j < y1; j++) for (let i = x0; i < x1; i++) buf[j * W + i] = c;
+}
+function disc(cx, cy, r, c) {
+  for (let j = -r; j <= r; j++) for (let i = -r; i <= r; i++)
+    if (i * i + j * j <= r * r + r * 0.8) px(cx + i, cy + j, c);
+}
+function ring(cx, cy, r, c, dash = 0, phase = 0) {
+  const n = Math.max(12, Math.round(r * 7));
+  for (let k = 0; k < n; k++) {
+    if (dash && ((k + phase) % (dash * 2)) >= dash) continue;
+    const a = k / n * Math.PI * 2;
+    px(Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r), c);
+  }
+}
+// linha Bresenham; dash = comprimento do traço (0 = contínua); phase anima "formiguinhas"
+function line(x0, y0, x1, y1, c, dash = 0, phase = 0) {
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, k = 0;
+  for (;;) {
+    if (!dash || (((k + Math.floor(phase)) % (dash * 2)) + dash * 2) % (dash * 2) < dash) px(x0, y0, c);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+    k++;
+  }
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[(y & 3) * 4 + (x & 3)];
+
+// ---------- aleatório determinístico + ruído periódico ----------
+function hash(a, b) {
+  let h = (a * 374761393 + b * 668265263) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function rng(seed) { let s = seed >>> 0; return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296); }
+function vnoise(x, y, period) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const p = (v) => ((v % period) + period) % period;
+  const a = hash(p(ix), iy), b = hash(p(ix + 1), iy), c = hash(p(ix), iy + 1), d = hash(p(ix + 1), iy + 1);
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+
+// ============================================================
+//  Fonte bitmap 5x7 (maiúsculas + acentos do português)
+// ============================================================
+const G = {
+  'A':'01110,10001,10001,11111,10001,10001,10001','B':'11110,10001,10001,11110,10001,10001,11110',
+  'C':'01110,10001,10000,10000,10000,10001,01110','D':'11110,10001,10001,10001,10001,10001,11110',
+  'E':'11111,10000,10000,11110,10000,10000,11111','F':'11111,10000,10000,11110,10000,10000,10000',
+  'G':'01110,10001,10000,10111,10001,10001,01111','H':'10001,10001,10001,11111,10001,10001,10001',
+  'I':'01110,00100,00100,00100,00100,00100,01110','J':'00111,00010,00010,00010,00010,10010,01100',
+  'K':'10001,10010,10100,11000,10100,10010,10001','L':'10000,10000,10000,10000,10000,10000,11111',
+  'M':'10001,11011,10101,10101,10001,10001,10001','N':'10001,10001,11001,10101,10011,10001,10001',
+  'O':'01110,10001,10001,10001,10001,10001,01110','P':'11110,10001,10001,11110,10000,10000,10000',
+  'Q':'01110,10001,10001,10001,10101,10010,01101','R':'11110,10001,10001,11110,10100,10010,10001',
+  'S':'01111,10000,10000,01110,00001,00001,11110','T':'11111,00100,00100,00100,00100,00100,00100',
+  'U':'10001,10001,10001,10001,10001,10001,01110','V':'10001,10001,10001,10001,10001,01010,00100',
+  'W':'10001,10001,10001,10101,10101,10101,01010','X':'10001,10001,01010,00100,01010,10001,10001',
+  'Y':'10001,10001,01010,00100,00100,00100,00100','Z':'11111,00001,00010,00100,01000,10000,11111',
+  '0':'01110,10001,10011,10101,11001,10001,01110','1':'00100,01100,00100,00100,00100,00100,01110',
+  '2':'01110,10001,00001,00010,00100,01000,11111','3':'11111,00010,00100,00010,00001,10001,01110',
+  '4':'00010,00110,01010,10010,11111,00010,00010','5':'11111,10000,11110,00001,00001,10001,01110',
+  '6':'00110,01000,10000,11110,10001,10001,01110','7':'11111,00001,00010,00100,01000,01000,01000',
+  '8':'01110,10001,10001,01110,10001,10001,01110','9':'01110,10001,10001,01111,00001,00010,01100',
+  '.':'00000,00000,00000,00000,00000,01100,01100',',':'00000,00000,00000,00000,01100,00100,01000',
+  ':':'00000,01100,01100,00000,01100,01100,00000','-':'00000,00000,00000,11111,00000,00000,00000',
+  '(':'00010,00100,01000,01000,01000,00100,00010',')':'01000,00100,00010,00010,00010,00100,01000',
+  '/':'00001,00010,00010,00100,01000,01000,10000','!':'00100,00100,00100,00100,00100,00000,00100',
+  '?':'01110,10001,00001,00010,00100,00000,00100','≈':'00000,01101,10110,00000,01101,10110,00000',
+  '~':'00000,00000,01101,10110,00000,00000,00000','→':'00000,00100,00010,11111,00010,00100,00000',
+  '↓':'00100,00100,00100,00100,10101,01110,00100','↔':'00000,00000,01010,11111,01010,00000,00000',
+  '+':'00000,00100,00100,11111,00100,00100,00000','=':'00000,00000,11111,00000,11111,00000,00000',
+  '%':'11000,11001,00010,00100,01000,10011,00011',"'":'00100,00100,01000,00000,00000,00000,00000',
+  '>':'01000,00100,00010,00001,00010,00100,01000','<':'00010,00100,01000,10000,01000,00100,00010',
+  ' ':'00000,00000,00000,00000,00000,00000,00000',
+};
+const ACC = { acute: '00010,00100', grave: '01000,00100', circ: '00100,01010', tilde: '01101,10110', ced: '00100,01100' };
+const COMPOSED = { 'Á':['A','acute'],'À':['A','grave'],'Â':['A','circ'],'Ã':['A','tilde'],'É':['E','acute'],
+  'Ê':['E','circ'],'Í':['I','acute'],'Ó':['O','acute'],'Ô':['O','circ'],'Õ':['O','tilde'],'Ú':['U','acute'],'Ç':['C','ced'] };
+const GLY = {};
+for (const k in G) GLY[k] = G[k].split(',');
+const ACCR = {}; for (const k in ACC) ACCR[k] = ACC[k].split(',');
+
+function glyph(ch, x, y, s, c) {
+  let base = ch, acc = null;
+  if (COMPOSED[ch]) [base, acc] = COMPOSED[ch];
+  const rows = GLY[base] || GLY['?'];
+  for (let r = 0; r < 7; r++) for (let q = 0; q < 5; q++)
+    if (rows[r][q] === '1') rect(x + q * s, y + r * s, s, s, c);
+  if (acc) {
+    const ar = ACCR[acc], oy = acc === 'ced' ? 7 : -3;
+    for (let r = 0; r < 2; r++) for (let q = 0; q < 5; q++)
+      if (ar[r][q] === '1') rect(x + q * s, y + (oy + r) * s, s, s, c);
+  }
+}
+const textW = (str, s = 1) => str.length * 6 * s - s;
+// desenha texto com sombra; reveal = nº de caracteres visíveis (efeito máquina de escrever)
+function text(str, x, y, c = PAL.white, { s = 1, align = 'center', reveal = Infinity, sh = PAL.shadow } = {}) {
+  const w = textW(str, s);
+  let x0 = align === 'center' ? Math.round(x - w / 2) : align === 'right' ? x - w : x;
+  const n = Math.min(str.length, Math.floor(reveal));
+  for (let i = 0; i < n; i++) {
+    const ch = str[i];
+    if (ch === ' ') continue;
+    if (sh !== null) { glyph(ch, x0 + i * 6 * s + s, y + s, s, sh); glyph(ch, x0 + i * 6 * s, y + s, s, sh); }
+    glyph(ch, x0 + i * 6 * s, y, s, c);
+  }
+}
+// bloco de linhas com máquina de escrever; retorna o tempo em que termina
+function typeLines(lines, y, lt, t0, { c = PAL.white, cps = 32, lh = 11, s = 1 } = {}) {
+  let t = t0;
+  lines.forEach((ln, i) => {
+    const str = typeof ln === 'string' ? ln : ln[0];
+    const col = typeof ln === 'string' ? c : ln[1];
+    const rev = (lt - t) * cps;
+    if (rev > 0) text(str, W / 2, y + i * lh, col, { s, reveal: rev });
+    t += str.length / cps + 0.12;
+  });
+  return t;
+}
+
+// ============================================================
+//  Elementos de cena
+// ============================================================
+const STARS = (() => { const r = rng(42), a = []; for (let i = 0; i < 170; i++) a.push([r() * W | 0, r() * H | 0, r(), r() * 6.28]); return a; })();
+function space(t, top = PAL.space, bottom = PAL.space2) {
+  for (let y = 0; y < H; y++) {
+    const f = y / H;
+    for (let x = 0; x < W; x++) buf[y * W + x] = bayer(x, y) < f * 0.9 ? bottom : top;
+  }
+  for (const [x, y, b, ph] of STARS) {
+    const tw = Math.sin(t * 2.2 + ph);
+    px(x, y, b > 0.85 ? (tw > 0.2 ? PAL.star : PAL.star2) : b > 0.45 ? PAL.star2 : PAL.star3);
+    if (b > 0.97 && tw > 0.6) { px(x - 1, y, PAL.star3); px(x + 1, y, PAL.star3); px(x, y - 1, PAL.star3); px(x, y + 1, PAL.star3); }
+  }
+}
+
+// Globo com textura procedural, iluminação em 3 tons e dithering no terminador.
+// yaw gira a Terra; tilt inclina a câmera (mostra mais o hemisfério norte).
+const LIGHT = (() => { const v = [-0.55, 0.5, 0.67]; const m = Math.hypot(...v); return v.map(a => a / m); })();
+function earthColor(lon, lat, shade, x, y, t, clouds = true) {
+  const u = (lon / (Math.PI * 2) + 1) * 14, v = (lat / Math.PI + 0.5) * 9;
+  const n = 0.62 * vnoise(u, v, 14) + 0.38 * vnoise(u * 2.3, v * 2.3, 32.2);
+  let col;
+  const ice = Math.abs(lat) > 1.22 + 0.08 * vnoise(u * 3, v * 3, 42);
+  const isLand = n > 0.56;
+  const day = shade + (bayer(x, y) - 0.5) * 0.25 > 0;
+  if (!day) {
+    if (ice) return PAL.nightO;
+    if (isLand) return (n > 0.62 && hash(Math.floor(u * 9), Math.floor(v * 9)) > 0.86) ? PAL.city : PAL.nightL;
+    return PAL.nightO;
+  }
+  const bright = shade + (bayer(x, y) - 0.5) * 0.3 > 0.62;
+  if (ice) col = PAL.ice;
+  else if (isLand) col = n > 0.66 ? (bright ? PAL.land : PAL.landD) : (n < 0.585 ? PAL.sand : (bright ? PAL.landL : PAL.land));
+  else col = bright ? PAL.ocean : (shade < 0.25 ? PAL.oceanD : PAL.ocean);
+  if (bright && !isLand && !ice && n > 0.5) col = PAL.oceanL;
+  if (clouds) {
+    const cn = vnoise(u * 1.7 + t * 0.15, v * 2.2, 23.8) * 0.6 + vnoise(u * 4, v * 5, 56) * 0.4;
+    if (cn > 0.68) col = shade > 0.35 ? PAL.cloud : PAL.cloudD;
+  }
+  return col;
+}
+function globe(cx, cy, r, yaw, tilt, t, { glow = true, clouds = true } = {}) {
+  const ct = Math.cos(tilt), st = Math.sin(tilt), cy_ = Math.cos(yaw), sy_ = Math.sin(yaw);
+  const x0 = Math.max(0, Math.floor(cx - r - 3)), x1 = Math.min(W - 1, Math.ceil(cx + r + 3));
+  const y0 = Math.max(0, Math.floor(cy - r - 3)), y1 = Math.min(H - 1, Math.ceil(cy + r + 3));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const dx = (x + 0.5 - cx) / r, dy = (y + 0.5 - cy) / r, d2 = dx * dx + dy * dy;
+    if (d2 > 1) {
+      if (glow) {
+        const d = Math.sqrt(d2) * r - r;
+        if (d < 1.2) buf[y * W + x] = PAL.atmo;
+        else if (d < 2.6 && bayer(x, y) < 0.55) buf[y * W + x] = PAL.atmo2;
+      }
+      continue;
+    }
+    const sz = Math.sqrt(1 - d2);
+    // vista -> mundo
+    const X1 = dx, Y2 = -sz, Z2 = -dy;
+    const Y1 = Y2 * ct + Z2 * st, Z1 = -Y2 * st + Z2 * ct;
+    const X = X1 * cy_ + Y1 * sy_, Y = -X1 * sy_ + Y1 * cy_, Z = Z1;
+    const shade = dx * LIGHT[0] + (-dy) * LIGHT[1] + sz * LIGHT[2];
+    let col = earthColor(Math.atan2(Y, X), Math.asin(Math.max(-1, Math.min(1, Z))), shade, x, y, t, clouds);
+    if (d2 > 0.93 && shade > 0) col = PAL.atmo2; // borda atmosférica
+    buf[y * W + x] = col;
+  }
+}
+// projeção de um ponto do mundo para a tela usando a mesma câmera do globo
+function project(p, cx, cy, r, yaw, tilt) {
+  const cyw = Math.cos(yaw), syw = Math.sin(yaw), ct = Math.cos(tilt), st = Math.sin(tilt);
+  const X1 = p[0] * cyw - p[1] * syw, Y1 = p[0] * syw + p[1] * cyw, Z1 = p[2];
+  const Y2 = Y1 * ct - Z1 * st, Z2 = Y1 * st + Z1 * ct;
+  return { x: cx + X1 * r, y: cy - Z2 * r, z: -Y2 };
+}
+function orbitPoint(inc, raan, u, R) {
+  const x = Math.cos(u), y = Math.sin(u) * Math.cos(inc), z = Math.sin(u) * Math.sin(inc);
+  return [(x * Math.cos(raan) - y * Math.sin(raan)) * R, (x * Math.sin(raan) + y * Math.cos(raan)) * R, z * R];
+}
+
+// Satélite Starlink estilizado: corpo chato + um painel solar longo
+function satellite(x, y, { flip = false, glow = false, t = 0, scale = 1 } = {}) {
+  x = Math.round(x); y = Math.round(y);
+  const s = scale, d = flip ? -1 : 1;
+  // painel solar
+  for (let i = 0; i < 9; i++) for (let j = 0; j < 3; j++) {
+    const c = (i % 3 === 2) ? PAL.panelD : (j === 0 ? PAL.panelL : PAL.panel);
+    rect(x + d * (3 + i) * s - (flip ? s - 1 : 0), y + (j - 1) * s, s, s, c);
+  }
+  rect(x + d * 2 * s - (flip ? s - 1 : 0), y, s, s, PAL.grayD); // haste
+  // corpo
+  for (let i = -2; i <= 1; i++) for (let j = -1; j <= 1; j++)
+    rect(x + d * i * s - (flip ? s - 1 : 0), y + j * s, s, s, j === -1 ? PAL.white : PAL.grayL);
+  if (glow && Math.sin(t * 10) > 0) px(x - d * 2 * s, y - 2 * s, PAL.green);
+}
+function tinySat(x, y, c = PAL.white) { px(x, y, c); px(x - 1, y, PAL.panel); px(x + 1, y, PAL.panel); }
+
+function dishIcon(x, y, angle = -0.6) { // antena retangular do usuário sobre um mastro
+  line(x, y, x, y + 6, PAL.grayD);
+  const ca = Math.cos(angle), sa = Math.sin(angle);
+  for (let i = -4; i <= 4; i++) for (let j = 0; j < 2; j++)
+    px(x + i * ca - j * sa, y - 1 + i * sa + j * ca, j ? PAL.gray : PAL.white);
+}
+function house(x, y) { // x,y = canto inferior esquerdo; 26 x 20
+  for (let i = 0; i < 14; i++) rect(x - 1 + i, y - 20 + 13 - i, 28 - 2 * i, 1, i < 2 ? PAL.roofD : PAL.roof);
+  rect(x + 2, y - 10, 22, 10, PAL.wall); rect(x + 2, y - 10, 22, 1, PAL.wallD);
+  rect(x + 5, y - 8, 5, 4, PAL.win); rect(x + 16, y - 8, 5, 4, PAL.win);
+  rect(x + 11, y - 6, 4, 6, PAL.roofD);
+}
+function gateway(x, y) { // estação terrestre: prédio + 2 radomes
+  rect(x, y - 9, 34, 9, PAL.grayL); rect(x, y - 9, 34, 1, PAL.white);
+  for (let i = 0; i < 4; i++) rect(x + 3 + i * 8, y - 6, 4, 2, PAL.cyan);
+  for (const ox of [7, 25]) {
+    for (let j = 0; j < 7; j++) for (let i = -6; i <= 6; i++) if (i * i + (j - 7) * (j - 7) <= 40) px(x + ox + i, y - 9 - 7 + j, j < 2 ? PAL.white : (i < 0 ? PAL.white : PAL.grayL));
+    rect(x + ox - 1, y - 11, 3, 2, PAL.gray);
+  }
+}
+function cloudIcon(cx, cy, t) {
+  const blobs = [[-9, 2, 6], [-2, -3, 8], [8, 0, 6], [0, 4, 6], [12, 4, 4], [-13, 5, 3]];
+  for (const [ox, oy, r] of blobs) disc(cx + ox, cy + oy, r, PAL.cloudD);
+  for (const [ox, oy, r] of blobs) disc(cx + ox, cy + oy - 1, r - 1, PAL.white);
+  text('WWW', cx, cy - 2, Math.sin(t * 4) > 0 ? PAL.panel : PAL.panelD, { sh: null });
+}
+function packet(x, y, c = PAL.yellow, t = 0) {
+  const k = Math.sin(t * 20) > 0;
+  rect(x - 1, y - 1, 3, 3, c); px(x, y, PAL.white);
+  if (k) { px(x - 2, y, c); px(x + 2, y, c); px(x, y - 2, c); px(x, y + 2, c); }
+}
+function alongPath(pts, f) { // posição ao longo de uma polilinha, f ∈ [0,1]
+  const seg = []; let L = 0;
+  for (let i = 1; i < pts.length; i++) { const l = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); seg.push(l); L += l; }
+  let d = Math.max(0, Math.min(1, f)) * L;
+  for (let i = 0; i < seg.length; i++) {
+    if (d <= seg[i] || i === seg.length - 1) {
+      const k = seg[i] ? d / seg[i] : 0;
+      return [pts[i][0] + (pts[i + 1][0] - pts[i][0]) * k, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * k, i];
+    }
+    d -= seg[i];
+  }
+}
+function header(n, title, lt) {
+  const slide = Math.min(1, lt / 0.35);
+  const y = Math.round(-30 + 38 * (1 - Math.pow(1 - slide, 3)));
+  if (n) {
+    const tag = `PASSO ${n}/6`;
+    rect(W / 2 - textW(tag) / 2 - 3, y - 2, textW(tag) + 6, 11, PAL.tagBg);
+    text(tag, W / 2, y, PAL.cyan, { sh: null });
+  }
+  text(title, W / 2, y + 13, PAL.white, { s: 2, reveal: (lt - 0.15) * 30 });
+}
+function sky(top, bottom, horizonY) {
+  for (let y = 0; y < horizonY; y++) {
+    const f = Math.pow(y / horizonY, 1.6);
+    for (let x = 0; x < W; x++) buf[y * W + x] = bayer(x, y) < f ? bottom : top;
+  }
+}
+
+// ============================================================
+//  Cenas — Flamengo em 30 segundos
+// ============================================================
+const SCENES = [];
+function scene(dur, fn) { SCENES.push({ dur, fn }); }
+const R = C('#d4161c'), RD = C('#8f0d12'), RL = C('#ff4a4a'), K = C('#141414'), K2 = C('#262626');
+const GOLD = C('#ffcc33'), GOLDD = C('#c48a12'), GOLDL = C('#fff1a8'), SKIN = C('#c98a5a'), SKIND = C('#8f5a35');
+const PITCH = C('#2f8f3a'), PITCH2 = C('#38a345');
+
+function stripes(t, angle = 1, w = 14, speed = 12) { // fundo rubro-negro diagonal
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = Math.floor((x + y * angle + t * speed) / w);
+    buf[y * W + x] = (v & 1) ? R : K;
+  }
+}
+function band(y, h, c = PAL.shadow) { // faixa escura com borda pontilhada
+  for (let j = y; j < y + h; j++) for (let x = 0; x < W; x++)
+    if (j < y + 2 || j > y + h - 3 ? bayer(x, j) < 0.5 : true) buf[j * W + x] = c;
+}
+function ball(x, y, t) {
+  disc(x, y, 3, PAL.white);
+  const k = Math.floor(t * 8) % 2;
+  px(x - 1 + k, y - 1, K); px(x + 1 - k, y + 1, K); px(x + 1, y - 1 + k, K);
+}
+function player(x, y, t, num = '') { // x,y = pés; ~13 x 26 px, camisa listrada horizontal
+  x = Math.round(x); y = Math.round(y);
+  const f = Math.floor(t * 8) % 2;
+  // pernas e meiões
+  rect(x - 3 + (f ? 1 : -1), y - 8, 2, 6, SKIN); rect(x + 1 + (f ? -1 : 1), y - 8, 2, 6, SKIN);
+  rect(x - 3 + (f ? 1 : -1), y - 4, 2, 3, PAL.white); rect(x + 1 + (f ? -1 : 1), y - 4, 2, 3, PAL.white);
+  rect(x - 4 + (f ? 1 : -1), y - 1, 3, 1, K); rect(x + 1 + (f ? -1 : 1), y - 1, 3, 1, K);
+  rect(x - 3, y - 11, 6, 3, PAL.white); // calção
+  for (let j = 0; j < 9; j++) rect(x - 4, y - 20 + j, 8, 1, (j >> 1) & 1 ? K : R); // camisa listrada
+  rect(x - 6 + (f ? 0 : 1), y - 19, 2, 5, R); rect(x + 4 - (f ? 0 : 1), y - 19, 2, 5, R); // mangas
+  rect(x - 6 + (f ? 0 : 1), y - 14, 2, 2, SKIN); rect(x + 4 - (f ? 0 : 1), y - 14, 2, 2, SKIN);
+  if (num) text(num, x, y - 19, PAL.white, { sh: null });
+  rect(x - 2, y - 26, 5, 6, SKIN); rect(x - 2, y - 27, 5, 2, K); px(x + 1, y - 24, K); // cabeça
+}
+function trophy(cx, by, s = 1) { // taça dourada genérica
+  const P = (x, y, w, h, c) => rect(cx + x * s, by + y * s, w * s, h * s, c);
+  P(-7, -4, 14, 4, GOLDD); P(-5, -6, 10, 2, GOLD);              // base
+  P(-1, -12, 3, 6, GOLD);                                         // haste
+  for (let j = 0; j < 12; j++) { const w = 12 - Math.floor(j * j / 18); P(-w / 2 | 0, -24 + j, w, 1, j < 2 ? GOLDL : (j % 4 === 0 ? GOLDD : GOLD)); }
+  P(-10, -23, 3, 1, GOLD); P(-10, -23, 1, 6, GOLD); P(-10, -17, 3, 1, GOLD);   // alças
+  P(7, -23, 3, 1, GOLD); P(9, -23, 1, 6, GOLD); P(7, -17, 3, 1, GOLD);
+  P(-3, -22, 1, 5, GOLDL);
+}
+function bigYear(y, str, lt, c = GOLD) {
+  const k = Math.min(1, lt / 0.35), s = 4;
+  text(str, W / 2, Math.round(y - (1 - k) * 30), c, { s, sh: K });
+}
+
+// 0 — Abertura
+scene(4.0, (lt, t) => {
+  stripes(t);
+  band(96, 74);
+  const k = Math.min(1, lt / 0.4);
+  text('FLAMENGO', W / 2, Math.round(108 - (1 - k) * 20), PAL.white, { s: 3, reveal: lt * 18, sh: RD });
+  if (lt > 0.8) text('A HISTÓRIA EM 30 S', W / 2, 146, GOLD, { reveal: (lt - 0.8) * 30 });
+  const bx = 90, by = 240 - Math.abs(Math.sin(lt * 5)) * 30;
+  disc(bx, 262, 4, PAL.shadow);
+  ball(bx, Math.round(by), lt);
+});
+
+// 1 — 1895: clube de regatas
+scene(6.0, (lt, t) => {
+  // céu de fim de tarde
+  const sky = [C('#2a1b4d'), C('#5b2a5e'), C('#b8445a'), C('#f08a4b'), C('#ffc56b')];
+  for (let y = 0; y < 220; y++) { const f = y / 220 * 4; for (let x = 0; x < W; x++) buf[y * W + x] = sky[Math.min(4, Math.floor(f + bayer(x, y) * 0.99))]; }
+  disc(60, 205, 16, C('#ffe39a'));
+  // morros (Pão de Açúcar estilizado)
+  const hill = (x) => Math.min(
+    220 - 95 * Math.exp(-Math.pow((x - 140) / 13, 2)),   // pão
+    220 - 45 * Math.exp(-Math.pow((x - 105) / 14, 2)),   // morro da Urca
+    220 - 20 * Math.exp(-Math.pow((x - 20) / 30, 2)));
+  for (let x = 0; x < W; x++) for (let y = Math.round(hill(x)); y < 220; y++) px(x, y, y < hill(x) + 2 ? C('#3a2a52') : C('#241a3a'));
+  // mar
+  for (let y = 220; y < H; y++) for (let x = 0; x < W; x++) {
+    const w = Math.sin(x * 0.3 + y * 0.8 - lt * 3) + Math.sin(x * 0.11 + lt);
+    buf[y * W + x] = w > 1.3 ? C('#7fb6e6') : (y < 226 && Math.abs(x - 60) < 14 && bayer(x, y) < 0.5 ? C('#ffd38a') : (bayer(x, y) < (y - 220) / 140 ? C('#123a6b') : C('#1d5592')));
+  }
+  // barco a remo
+  const bx = Math.round(-30 + lt * 24), by = 252;
+  rect(bx - 22, by, 46, 3, RD); rect(bx - 20, by + 3, 42, 1, K); rect(bx - 22, by - 1, 46, 1, R);
+  const ph = Math.sin(lt * 6);
+  for (let i = 0; i < 4; i++) {
+    const rx = bx - 14 + i * 9, lean = ph > 0 ? 1 : -1;
+    rect(rx, by - 6, 3, 5, i % 2 ? K : R); rect(rx + lean, by - 9, 3, 3, SKIN);
+    line(rx + 1, by - 3, rx - 6 - lean * 3, by + 6, C('#e0c48a'));
+  }
+  bigYear(28, '1895', lt);
+  typeLines(['CLUBE DE REGATAS', 'DO FLAMENGO'], 72, lt, 0.5, { c: PAL.white, cps: 30 });
+  if (lt > 1.6) text('RIO DE JANEIRO', W / 2, 300, PAL.white, { reveal: (lt - 1.6) * 30 });
+});
+
+// 2 — 1911: nasce o futebol
+scene(4.9, (lt, t) => {
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) buf[y * W + x] = (Math.floor((y + 4) / 20) & 1) ? PITCH : PITCH2;
+  rect(0, 196, W, 1, PAL.white); ring(90, 196, 30, PAL.white);
+  disc(90, 196, 1, PAL.white);
+  const px_ = 30 + lt * 26;
+  player(px_, 250, lt, '');
+  ball(Math.round(px_ + 10 + Math.abs(Math.sin(lt * 7)) * 3), 247, lt);
+  bigYear(28, '1911', lt, PAL.white);
+  typeLines(['NASCE O FUTEBOL', ['RUBRO-NEGRO', GOLD]], 72, lt, 0.4, { cps: 30 });
+});
+
+// 3 — 1981: Libertadores e Mundial
+scene(5.9, (lt, t) => {
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) buf[y * W + x] = bayer(x, y) < y / 400 ? C('#0f1838') : C('#070b1f');
+  // refletores
+  for (const lx of [20, 160]) { rect(lx - 8, 112, 17, 6, PAL.grayD); for (let i = 0; i < 4; i++) rect(lx - 7 + i * 4, 113, 3, 4, Math.sin(t * 9 + i) > -0.6 ? PAL.white : PAL.yellow); rect(lx, 118, 1, 70, PAL.grayD); }
+  // arquibancada
+  for (let y = 188; y < 238; y++) for (let x = 0; x < W; x++) {
+    const seat = hash(x >> 1, y >> 1);
+    buf[y * W + x] = seat > 0.55 ? (seat > 0.78 ? R : K2) : (Math.sin(t * 6 + x) > 0.7 && seat > 0.4 ? PAL.white : C('#1b1b2e'));
+  }
+  for (let y = 238; y < H; y++) for (let x = 0; x < W; x++) buf[y * W + x] = (Math.floor(x / 16) & 1) ? PITCH : PITCH2;
+  // placar
+  rect(46, 124, 88, 22, K); rect(47, 125, 86, 20, C('#202020'));
+  const blink = lt > 1.0;
+  text('FLA 3 X 0 LIV', 90, 132, blink ? GOLD : PAL.grayD, { sh: null });
+  player(56, 292, lt * 0.6, '10');
+  trophy(130, 296, 2);
+  bigYear(28, '1981', lt);
+  typeLines(['LIBERTADORES', ['+ MUNDIAL', GOLD]], 72, lt, 0.5, { cps: 30 });
+  if (lt > 2.2) text('ERA ZICO', W / 2, 98, PAL.white, { reveal: (lt - 2.2) * 30 });
+});
+
+// 4 — 2019 e a torcida
+const CONF = (() => { const r = rng(7), a = []; for (let i = 0; i < 90; i++) a.push([r() * W, r() * 400, 15 + r() * 25, r() < 0.4 ? 0 : r() < 0.7 ? 1 : 2]); return a; })();
+scene(6.3, (lt, t) => {
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) buf[y * W + x] = bayer(x, y) < 0.3 ? C('#1a0b10') : C('#0e0609');
+  // torcida pulando
+  for (let row = 0; row < 7; row++) for (let i = 0; i < 20; i++) {
+    const x = i * 9 + (row % 2) * 4, jump = Math.max(0, Math.sin(t * 7 + i * 0.9 + row)) * 3;
+    const y = 300 - row * 13 - jump;
+    const c = hash(i, row) > 0.5 ? R : K;
+    rect(x, y, 6, 7, c); rect(x + 1, y - 4, 4, 4, hash(i, row + 9) > 0.5 ? SKIN : SKIND);
+    if (jump > 2) { rect(x - 1, y - 6, 1, 4, SKIN); rect(x + 6, y - 6, 1, 4, SKIN); }
+  }
+  // bandeiras
+  for (const [fx, fy] of [[22, 196], [150, 192], [90, 206]]) {
+    line(fx, fy, fx, fy + 30, PAL.grayL);
+    for (let j = 0; j < 14; j++) for (let i = 0; i < 22; i++) {
+      const wv = Math.round(Math.sin(i * 0.4 - t * 6) * 2 * (i / 22));
+      px(fx + 1 + i, fy + j + wv, (j >> 1) & 1 ? K : R);
+    }
+  }
+  trophy(90, 170, 2);
+  // confete
+  for (const [cx, cy, sp, c] of CONF) {
+    const y = (cy + lt * sp * 3) % 330 - 10, x = cx + Math.sin(lt * 3 + cy) * 4;
+    px(x, y, c === 0 ? R : c === 1 ? GOLD : PAL.white); px(x + 1, y, c === 0 ? RD : c === 1 ? GOLDD : PAL.grayL);
+  }
+  bigYear(28, '2019', lt);
+  if (lt < 3.2) typeLines(['CAMPEÃO DA', ['AMÉRICA', GOLD]], 72, lt, 0.5, { cps: 30 });
+  else typeLines(['A MAIOR TORCIDA', ['DO BRASIL', GOLD]], 72, lt, 3.2, { cps: 30 });
+});
+
+// 5 — Fechamento
+scene(2.9, (lt, t) => {
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const wy = y + Math.sin(x * 0.06 - t * 5) * 6;
+    buf[y * W + x] = (Math.floor(wy / 18) & 1) ? R : K;
+  }
+  band(96, 132);
+  const L = ['UMA VEZ', 'FLAMENGO,', 'SEMPRE', 'FLAMENGO!'];
+  L.forEach((s, i) => text(s, W / 2, 106 + i * 29, i % 2 ? GOLD : PAL.white, { s: 2, reveal: (lt - i * 0.25) * 30, sh: K }));
+});
+
+// ============================================================
+//  Transições (dithering) e loop principal
+// ============================================================
+const TOTAL = SCENES.reduce((a, s) => a + s.dur, 0);
+const FADE = 0.3;
+function fadeOverlay(a) { // a ∈ [0,1]: 1 = preto total
+  if (a <= 0) return;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (bayer(x >> 1, y >> 1) < a) buf[y * W + x] = PAL.black;
+}
+function renderAt(t) {
+  t = ((t % TOTAL) + TOTAL) % TOTAL;
+  let acc = 0;
+  for (let i = 0; i < SCENES.length; i++) {
+    const s = SCENES[i];
+    if (t < acc + s.dur || i === SCENES.length - 1) {
+      const lt = t - acc;
+      s.fn(lt, t);
+      const a = Math.max(lt < FADE ? 1 - lt / FADE : 0, lt > s.dur - FADE ? (lt - (s.dur - FADE)) / FADE : 0);
+      fadeOverlay(a);
+      break;
+    }
+    acc += s.dur;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+// exportação de quadros (usada pelo render.mjs)
+window.__starlink = {
+  W, H, TOTAL, renderAt,
+  frameB64(t) { renderAt(t); const u8 = new Uint8Array(img.data.buffer); let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); },
+};
+
+const params = new URLSearchParams(location.search);
+let paused = params.has('t'), clock = parseFloat(params.get('t') || '0'), last = performance.now();
+function sceneStart(i) { let a = 0; for (let k = 0; k < i; k++) a += SCENES[k].dur; return a; }
+function currentScene() { let a = 0; for (let i = 0; i < SCENES.length; i++) { a += SCENES[i].dur; if (clock % TOTAL < a) return i; } return 0; }
+cv.addEventListener('click', () => { paused = !paused; });
+addEventListener('keydown', (e) => {
+  if (e.key === ' ') paused = !paused;
+  if (e.key === 'ArrowRight') clock = sceneStart((currentScene() + 1) % SCENES.length) + 0.01;
+  if (e.key === 'ArrowLeft') clock = sceneStart((currentScene() + SCENES.length - 1) % SCENES.length) + 0.01;
+});
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  if (!paused) clock += dt;
+  if (!params.has('record')) renderAt(clock);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
